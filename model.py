@@ -117,7 +117,7 @@ class JinaReranker(nn.Module):
         doc_ctx, doc_counts = extract_marker_embeddings(
             hidden, input_ids, self.doc_emb_token_id, max_markers=max_docs
         )
-        
+
         print(doc_counts)
 
         q_ctx, q_counts = extract_marker_embeddings(hidden, input_ids, self.query_emb_token_id)
@@ -130,8 +130,8 @@ class JinaReranker(nn.Module):
 
         q_start = self.projector(q_first_ctx) if has_start else None
 
-        docs_n = F.normalize(docs)
-        q_end_n = F.normalize(q_end)
+        docs_n = F.normalize(docs, dim=-1)
+        q_end_n = F.normalize(q_end, dim=-1)
         scores = (docs_n * q_end_n.unsqueeze(1)).sum(dim=-1)  # (B, K)
 
         return RerankerForwardOutput(q_end=q_end, q_start=q_start, docs=docs, scores=scores)
