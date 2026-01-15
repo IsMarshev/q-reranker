@@ -1,0 +1,50 @@
+datasets: 
+  train: "./datasets/train/train.json"
+  test: "./datasets/test"
+out_dir: "ckpt_stage1"
+
+lr: 5e-5
+weight_decay: 0.01
+epochs: 1 
+warmup_ratio: 0.03 
+grad_clip: 1.0
+
+micro_batch_size: 1         
+global_batch_size: 60     
+num_workers: 2 
+
+temperature: 0.25         
+enable_similar: False
+
+accelerator: "cpu"
+devices: 0
+precision: "bf16-mixed"
+
+log_every: 10
+save_every: 500
+
+collator: 
+  num_docs: 16        
+  num_negs: 15  
+
+  doc_max_tokens: 768  
+  max_length: 12288  
+
+  pad_to_multiple_of: 8
+  add_query_emb_at_start: True 
+
+  return_text: False   
+
+model: 
+  backbone_name_or_path: "Qwen/Qwen3-0.6B"
+
+  projector_in_dim: 1024
+  projector_hidden_dim: 512
+  projector_out_dim: 512
+
+  trust_remote_code: True
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
