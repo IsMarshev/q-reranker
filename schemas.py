@@ -3,16 +3,15 @@ from pydantic import Field, BaseModel
 import yaml
 
 class RerankerCollatorConfig(BaseModel):
-    num_docs: int        
-    doc_max_tokens: int      
-    max_length: Optional[int]  
-    pad_to_multiple_of: Optional[int]
+    num_docs: int            
+    num_negs: int
 
-    add_query_emb_at_start: bool 
-    add_generation_prompt: bool
+    doc_max_tokens: int        
+    max_length: int
 
-    shuffle_docs: bool          
-    return_text: bool      
+    pad_to_multiple_of: int
+    add_query_emb_at_start: bool
+    return_text: bool
 
 class ModelConfig(BaseModel):
     backbone_name_or_path: str
@@ -25,6 +24,11 @@ class ModelConfig(BaseModel):
 class DatasetsPath(BaseModel):
     train: str
     test: str
+
+class LoraConfig(BaseModel):
+    r: int
+    alpha: int
+    dropout: int
 
 class TrainConfig(BaseModel):
     datasets: DatasetsPath
@@ -52,6 +56,7 @@ class TrainConfig(BaseModel):
 
     collator: RerankerCollatorConfig
     model: ModelConfig
+    lora: LoraConfig
 
 
 def load_config(path: str) -> TrainConfig:
