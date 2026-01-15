@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from typing import Dict, Optional
+
 
 class InfoNCELoss(nn.Module):
     def __init__(self, temperature: float = 0.05):
@@ -95,3 +97,47 @@ class SimilarityLoss(nn.Module):
             return F.cross_entropy(logits, pos_index)
         else:
             return F.cross_entropy(logits[:N], pos_index[:N])
+
+
+class MultiLoss(nn.Module):
+    def __init__(
+        self,
+        temperature: float = 0.25,
+        w_disperse: float = 0.45,
+        w_dual: float = 0.85,
+        w_similar: float = 0.85,
+        enable_similar: bool = False,
+    ):
+        super().__init__()
+        self.rank = InfoNCELoss(temperature)
+        self.disperse = DisperseLoss(temperature)
+        self.similar = SimilarityLoss(temperature)
+
+        self.w_disperse = w_disperse
+        self.w_dual = w_dual
+        self.w_similar = w_similar
+        self.enable_similar = enable_similar
+
+    def forward(
+        self,
+        q_end: torch.Tensor,       
+        docs: torch.Tensor,          
+        q_start: Optional[torch.Tensor] = None,
+        docs_aug: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        d_pos = docs[:, 0, :]
+        d_neg = docs[:, 1:, :]
+
+        l_rank = self.rank(q_end, d_pos, d_neg)
+        l_disp = self.disperse(d_pos, d_neg)
+
+        l_dual = torch.zeros_like(l_rank)
+        if q_start is not None:
+            l_dual = self.rank(q_start, d_pos, d_neg)
+
+        l_sim = torch.zeros_like(l_rank)
+        if self.enable_similar and (docs_aug is not None):
+            l_sim = self.similar(docs, docs_aug)
+
+        total = l_rank + self.w_disperse * l_disp + self.w_dual * l_dual + self.w_similar * l_sim
+        return {"loss": total, "l_rank": l_rank, "l_disperse": l_disp, "l_dual": l_dual, "l_similar": l_sim}
