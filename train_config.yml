@@ -9,19 +9,19 @@ epochs: 1
 warmup_ratio: 0.03 
 grad_clip: 1.0
 
-micro_batch_size: 1         
+micro_batch_size: 2         
 global_batch_size: 60     
 num_workers: 2 
 
 temperature: 0.25         
 enable_similar: False
 
-accelerator: "cpu"
-devices: 0
+accelerator: "cuda"
+devices: 1
 precision: "bf16-mixed"
 
-log_every: 10
-save_every: 500
+log_every: 1
+save_every: 50
 
 collator: 
   num_docs: 16        

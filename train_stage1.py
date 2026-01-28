@@ -4,13 +4,13 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from torch.utils.data import Dataset, DataLoader
 from logging import Logger
 
-from dataclasses import dataclass
+from dataclasses import asdict
 
-from collator_fn import RerankerCollatorConfig, Stage1PromptCollator
+from collator_fn import Stage1PromptCollator
 from model import JinaReranker
 from loss import MultiLoss
 from schemas import TrainConfig
@@ -18,38 +18,77 @@ from lightning.fabric import Fabric
 
 from peft import LoraConfig, get_peft_model
 
+# --- W&B ---
+import wandb
+
 
 class RerankerDataset(Dataset):
-    """
-    Lines
-      {"query": "...", "pos": "...", "neg": ["...", "...", ...]}
-    """
+    """JSON list of dicts: [{"query":.., "pos":.., "neg":[...]}]"""
     def __init__(self, path: str):
         with open(path, "r", encoding="utf-8") as f:
             self.data = json.load(f)
 
     def __len__(self):
         return len(self.data)
-    
+
     def __getitem__(self, idx):
         return self.data[idx]
-    
+
+
+def _flatten_dict(d, prefix=""):
+    """Flatten nested dataclass/dict for wandb.config."""
+    out = {}
+    for k, v in d.items():
+        kk = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.update(_flatten_dict(v, prefix=kk + "."))
+        else:
+            out[kk] = v
+    return out
+
 
 class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.logger = Logger("Trainer stage 1")
         self.cfg = cfg
 
-        self.fabric = Fabric(accelerator=self.cfg.accelerator, devices=self.cfg.devices, precision=self.cfg.precision)
+        self.fabric = Fabric(
+            accelerator=self.cfg.accelerator,
+            devices=self.cfg.devices,
+            precision=self.cfg.precision
+        )
         self.fabric.launch()
-        
+
         model_config = self.cfg.model
         lora_config = self.cfg.lora
+
+        # Init W&B only on rank 0
+        self.wandb_run = None
+        if self.fabric.is_global_zero:
+            # best effort: dataclass -> dict
+            try:
+                cfg_dict = asdict(cfg)
+            except Exception:
+                # fallback: if TrainConfig not dataclass
+                cfg_dict = cfg.__dict__
+
+            cfg_flat = _flatten_dict(cfg_dict)
+
+            self.wandb_run = wandb.init(
+                project=getattr(cfg, "wandb_project", "jina-reranker-stage1"),
+                entity=getattr(cfg, "wandb_entity", None),
+                name=getattr(cfg, "wandb_run_name", None),
+                tags=getattr(cfg, "wandb_tags", None),
+                config=cfg_flat,
+            )
+            wandb.define_metric("train/step")
+            wandb.define_metric("train/*", step_metric="train/step")
+
         self.tokenizer = self.init_tokenizer()
         self.logger.info("Токенайзер подготовлен")
 
         self.model = JinaReranker(
-            backbone_name_or_path = model_config.backbone_name_or_path,
+            backbone_name_or_path=model_config.backbone_name_or_path,
             tokenizer=self.tokenizer,
             doc_emb_token_id=self.tokenizer.convert_tokens_to_ids("<|doc_emb|>"),
             query_emb_token_id=self.tokenizer.convert_tokens_to_ids("<|query_emb|>"),
@@ -57,47 +96,63 @@ class Trainer:
             projector_hidden_dim=model_config.projector_hidden_dim,
             projector_out_dim=model_config.projector_out_dim,
             trust_remote_code=model_config.trust_remote_code
-            )
+        )
         self.logger.info("Модель загружена")
-        self.model.backbone = self.apply_lora_qwen(r=lora_config.r, alpha=lora_config.alpha, dropout=lora_config.dropout)
-        self.logger.info("ЛОРА конфиг приминен")
+
+        # Apply LoRA (freeze base inside)
+        self.model.backbone = self.apply_lora_qwen(
+            r=lora_config.r,
+            alpha=lora_config.alpha,
+            dropout=lora_config.dropout
+        )
+        self.logger.info("LoRA конфиг применён")
+
+        # optionally train embeddings (as you did)
         self.emb = self.model.backbone.get_input_embeddings()
         if self.emb is not None:
             self.emb.weight.requires_grad = True
 
         self.criterion = MultiLoss(
-                temperature=cfg.temperature,
-                w_disperse=0.45,
-                w_dual=0.85,
-                w_similar=0.85,
-                enable_similar=cfg.enable_similar,
+            temperature=cfg.temperature,
+            w_disperse=0.45,
+            w_dual=0.85,
+            w_similar=0.85,
+            enable_similar=cfg.enable_similar,
         )
 
+        # Data
         self.train_data = RerankerDataset(self.cfg.datasets.train)
         collator = Stage1PromptCollator(self.tokenizer, cfg.collator)
+
         self.dl = DataLoader(
-                            self.train_data,
-                            batch_size=self.cfg.micro_batch_size, 
-                            shuffle=True, 
-                            num_workers=self.cfg.num_workers,
-                            collate_fn=collator, 
-                            pin_memory=True)
+            self.train_data,
+            batch_size=self.cfg.micro_batch_size,
+            shuffle=True,
+            num_workers=self.cfg.num_workers,
+            collate_fn=collator,
+            pin_memory=True
+        )
+
+        # Optim
         self.optim = torch.optim.AdamW(
-                    [p for p in self.model.parameters() if p.requires_grad],
-                    lr=cfg.lr,
-                    weight_decay=cfg.weight_decay
-                )
-        
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay
+        )
+
         self.apply_fabric()
-        
+
+        # Watch model params/gradients (only rank0, and after fabric.setup)
+        if self.fabric.is_global_zero and self.wandb_run is not None and getattr(cfg, "wandb_watch", False):
+            # unwrap to avoid fabric wrappers
+            wandb.watch(self.fabric.unwrap(self.model), log="gradients", log_freq=cfg.log_every)
+
     def init_tokenizer(self):
-        tokenizer = AutoTokenizer.from_pretrained(self.cfg.model.backbone_name_or_path, trust_remote_code=self.cfg.model.trust_remote_code)
-        new_special_tokens = {
-            "additional_special_tokens": [
-                "<|query_emb|>", 
-                "<|doc_emb|>"
-            ]
-        }
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.cfg.model.backbone_name_or_path,
+            trust_remote_code=self.cfg.model.trust_remote_code
+        )
+        new_special_tokens = {"additional_special_tokens": ["<|query_emb|>", "<|doc_emb|>"]}
         num_added_toks = tokenizer.add_special_tokens(new_special_tokens)
         self.logger.info(f"Добавлено новых токенов: {num_added_toks}")
         return tokenizer
@@ -105,6 +160,7 @@ class Trainer:
     def apply_lora_qwen(self, r: int = 16, alpha: int = 32, dropout: float = 0.0) -> nn.Module:
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
+        # freeze base
         for p in self.model.backbone.parameters():
             p.requires_grad = False
 
@@ -114,7 +170,7 @@ class Trainer:
             lora_dropout=dropout,
             bias="none",
             target_modules=target_modules,
-            task_type="FEATURE_EXTRACTION", 
+            task_type="FEATURE_EXTRACTION",
         )
         self.model.backbone = get_peft_model(self.model.backbone, cfg)
         return self.model.backbone
@@ -123,12 +179,34 @@ class Trainer:
         self.model, self.optim = self.fabric.setup(self.model, self.optim)
         self.dl = self.fabric.setup_dataloaders(self.dl)
 
+    def _log_wandb(self, metrics: dict):
+        if self.fabric.is_global_zero and self.wandb_run is not None:
+            wandb.log(metrics)
+
+    def _save_checkpoint(self, save_dir: str):
+        os.makedirs(save_dir, exist_ok=True)
+        
+        model_unwrapped_proj = self.model.module if hasattr(self.model, 'module') else self.model
+        torch.save(model_unwrapped_proj.projector.state_dict(), os.path.join(save_dir, "projector.pt"))
+
+
+        model_unwrapped = self.model.module if hasattr(self.model, 'module') else self.model
+
+        model_unwrapped.backbone.save_pretrained(save_dir)
+        self.tokenizer.save_pretrained(save_dir)
+
+        # optional: log as artifact
+        if self.fabric.is_global_zero and self.wandb_run is not None and getattr(self.cfg, "wandb_artifacts", False):
+            art = wandb.Artifact(name=f"ckpt-{os.path.basename(save_dir)}", type="model")
+            art.add_dir(save_dir)
+            wandb.log_artifact(art)
+
     def train(self):
+        torch.set_float32_matmul_precision("high")
         world = self.fabric.world_size
         accum_steps = max(1, self.cfg.global_batch_size // (self.cfg.micro_batch_size * world))
         if self.fabric.is_global_zero:
             print(f"[fabric] world_size={world} micro_bs={self.cfg.micro_batch_size} accum_steps={accum_steps}")
-
         # Scheduler
         steps_per_epoch = math.ceil(len(self.dl) / accum_steps)
         total_steps = steps_per_epoch * self.cfg.epochs
@@ -137,7 +215,6 @@ class Trainer:
 
         self.model.train()
         global_step = 0
-        running = {}
 
         for epoch in range(self.cfg.epochs):
             for step, batch in enumerate(self.dl):
@@ -146,44 +223,72 @@ class Trainer:
                 with self.fabric.no_backward_sync(self.model, enabled=is_accum):
                     with self.fabric.autocast():
                         out = self.model(batch["input_ids"], batch["attention_mask"], max_docs=16)
-                        loss_dict = self.criterion(q_end=out.q_end, q_start=out.q_start, docs=out.docs, docs_aug=None)
+                        loss_dict = self.criterion(
+                            q_end=out.q_end,
+                            q_start=out.q_start,
+                            docs=out.docs,
+                            docs_aug=None
+                        )
                         loss = loss_dict["loss"] / accum_steps
 
                     self.fabric.backward(loss)
 
                 if not is_accum:
-                    self.fabric.clip_gradients(self.model, self.optim, max_norm=self.cfg.grad_clip)
+                    # grad norm before clipping (useful for wandb)
+                    grad_norm = None
+                    if self.fabric.is_global_zero:
+                        try:
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                [p for p in self.model.parameters() if p.requires_grad],
+                                max_norm=self.cfg.grad_clip
+                            ).item()
+                        except Exception:
+                            grad_norm = None
+                    else:
+                        # still clip through fabric
+                        self.fabric.clip_gradients(self.model, self.optim, max_norm=self.cfg.grad_clip)
+
                     self.optim.step()
                     scheduler.step()
                     self.optim.zero_grad(set_to_none=True)
 
                     global_step += 1
 
-                    if self.fabric.is_global_zero and (global_step % self.cfg.log_every == 0):
-                        msg = (f"ep={epoch} step={global_step}/{total_steps} "
+                    if global_step % self.cfg.log_every == 0:
+                        lr = self.optim.param_groups[0]["lr"]
+                        msg = (
+                            f"ep={epoch} step={global_step}/{total_steps} "
                             f"loss={loss_dict['loss'].item():.4f} "
                             f"rank={loss_dict['l_rank'].item():.4f} "
                             f"disp={loss_dict['l_disperse'].item():.4f} "
-                            f"dual={loss_dict['l_dual'].item():.4f}")
+                            f"dual={loss_dict['l_dual'].item():.4f}"
+                        )
                         if self.cfg.enable_similar:
                             msg += f" sim={loss_dict['l_similar'].item():.4f}"
-                        print(msg)
+                        if self.fabric.is_global_zero:
+                            print(msg)
+
+                        self._log_wandb({
+                            "train/step": global_step,
+                            "train/epoch": epoch,
+                            "train/lr": lr,
+                            "train/loss": loss_dict["loss"].item(),
+                            "train/l_rank": loss_dict["l_rank"].item(),
+                            "train/l_disperse": loss_dict["l_disperse"].item(),
+                            "train/l_dual": loss_dict["l_dual"].item(),
+                            "train/l_similar": (loss_dict["l_similar"].item() if self.cfg.enable_similar else 0.0),
+                            "train/grad_norm": (grad_norm if grad_norm is not None else 0.0),
+                        })
 
                     if (global_step % self.cfg.save_every == 0) and self.fabric.is_global_zero:
                         save_dir = os.path.join(self.cfg.out_dir, f"step_{global_step}")
-                        os.makedirs(save_dir, exist_ok=True)
-
-                        torch.save(self.fabric.unwrap(self.model).projector.state_dict(), os.path.join(save_dir, "projector.pt"))
-
-                        self.fabric.unwrap(self.model).backbone.save_pretrained(save_dir)
-                        self.tokenizer.save_pretrained(save_dir)
-
+                        self._save_checkpoint(save_dir)
                         print(f"[ckpt] saved to {save_dir}")
 
             if self.fabric.is_global_zero:
                 save_dir = os.path.join(self.cfg.out_dir, f"epoch_{epoch}")
-                os.makedirs(save_dir, exist_ok=True)
-                torch.save(self.fabric.unwrap(self.model).projector.state_dict(), os.path.join(save_dir, "projector.pt"))
-                self.fabric.unwrap(self.model).backbone.save_pretrained(save_dir)
-                self.tokenizer.save_pretrained(save_dir)
+                self._save_checkpoint(save_dir)
                 print(f"[ckpt] saved to {save_dir}")
+
+        if self.fabric.is_global_zero and self.wandb_run is not None:
+            wandb.finish()
